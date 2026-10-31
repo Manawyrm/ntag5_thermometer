@@ -1,0 +1,12 @@
+App(
+    appid="ntag5_thermometer",
+    name="NTAG5/BeUno temp reader",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="ntag5_thermometer_app",
+    requires=["gui", "notification"],
+    stack_size=2 * 1024,
+    fap_category="NFC",
+    fap_icon="paw_10px.png",
+    fap_version="0.1",
+    fap_description="Reads body temperature patches (NTAG 5 link with TMP117 sensor)",
+)
