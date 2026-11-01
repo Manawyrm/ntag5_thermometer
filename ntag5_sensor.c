@@ -54,22 +54,24 @@ struct Ntag5Sensor {
     BitBuffer* tx;
     BitBuffer* rx;
 
-    Ntag5SensorCallback callback;
+    TempSensorCallback callback;
     void* context;
     volatile bool stopping;
 
     /* NFC worker thread state */
     bool selected;
-    Ntag5SensorStatus last_status;
+    TempSensorStatus last_status;
+    char id[TEMP_SENSOR_ID_SIZE]; /**< UID of the attached tag */
 };
 
-static void ntag5_sensor_report(Ntag5Sensor* instance, const Ntag5SensorReading* reading) {
+static void ntag5_sensor_report(Ntag5Sensor* instance, TempSensorReading* reading) {
+    strlcpy(reading->id, instance->id, sizeof(reading->id));
     instance->last_status = reading->status;
     instance->callback(reading, instance->context);
 }
 
-static void ntag5_sensor_report_status(Ntag5Sensor* instance, Ntag5SensorStatus status) {
-    const Ntag5SensorReading reading = {.status = status, .temperature = 0.0f, .raw = 0};
+static void ntag5_sensor_report_status(Ntag5Sensor* instance, TempSensorStatus status) {
+    TempSensorReading reading = {.status = status};
     ntag5_sensor_report(instance, &reading);
 }
 
@@ -125,8 +127,14 @@ static Ntag5Result ntag5_sensor_attach(Ntag5Sensor* instance, Iso15693_3Poller* 
     }
 
     // Flipper keeps the UID most significant byte first: E0, manufacturer, ...
+    // Shown the same way as in the NFC app
+    char* id = instance->id;
+    for(size_t i = 0; i < ISO15693_3_UID_SIZE; i++) {
+        snprintf(id + 2 * i, sizeof(instance->id) - 2 * i, "%02X", uid[i]);
+    }
+
     if(uid[1] != NXP_MANUFACTURER) {
-        ntag5_sensor_report_status(instance, Ntag5SensorStatusNotSensor);
+        ntag5_sensor_report_status(instance, TempSensorStatusNotSensor);
         return Ntag5ResultTagError;
     }
 
@@ -149,7 +157,7 @@ static Ntag5Result ntag5_sensor_attach(Ntag5Sensor* instance, Iso15693_3Poller* 
 
     result = ntag5_sensor_exchange(instance, poller);
     if(result == Ntag5ResultTagError || bit_buffer_get_size_bytes(instance->rx) < 2) {
-        ntag5_sensor_report_status(instance, Ntag5SensorStatusNotSensor);
+        ntag5_sensor_report_status(instance, TempSensorStatusNotSensor);
         return Ntag5ResultTagError;
     }
     if(result != Ntag5ResultOk) {
@@ -157,7 +165,7 @@ static Ntag5Result ntag5_sensor_attach(Ntag5Sensor* instance, Iso15693_3Poller* 
     }
 
     if(!(bit_buffer_get_byte(instance->rx, 1) & NTAG5_EH_ENABLED_MASK)) {
-        ntag5_sensor_report_status(instance, Ntag5SensorStatusNoPower);
+        ntag5_sensor_report_status(instance, TempSensorStatusNoPower);
         return Ntag5ResultTagError;
     }
 
@@ -209,16 +217,15 @@ static Ntag5Result ntag5_sensor_measure(Ntag5Sensor* instance, Iso15693_3Poller*
         return Ntag5ResultTagError;
     }
 
-    Ntag5SensorReading reading = {
-        .status = Ntag5SensorStatusOk,
-        .raw = (bit_buffer_get_byte(instance->rx, 1) << 8) | bit_buffer_get_byte(instance->rx, 2),
-    };
+    const uint16_t raw = (bit_buffer_get_byte(instance->rx, 1) << 8) |
+                         bit_buffer_get_byte(instance->rx, 2);
+    TempSensorReading reading = {.status = TempSensorStatusOk};
 
-    if(reading.raw == TMP117_RESET_VALUE) {
-        reading.status = Ntag5SensorStatusNoValue;
+    if(raw == TMP117_RESET_VALUE) {
+        reading.status = TempSensorStatusNoValue;
     } else {
         // Signed, 1/128 degree per LSB
-        reading.temperature = (int16_t)reading.raw / 128.0f;
+        reading.temperature = (int16_t)raw / 128.0f;
     }
 
     ntag5_sensor_report(instance, &reading);
@@ -238,8 +245,8 @@ static NfcCommand ntag5_sensor_poller_callback(NfcGenericEvent event, void* cont
     if(poller_event->type != Iso15693_3PollerEventTypeReady) {
         // The poller found nothing in the field, it pauses by itself
         instance->selected = false;
-        if(instance->last_status != Ntag5SensorStatusWaiting) {
-            ntag5_sensor_report_status(instance, Ntag5SensorStatusWaiting);
+        if(instance->last_status != TempSensorStatusWaiting) {
+            ntag5_sensor_report_status(instance, TempSensorStatusWaiting);
         }
         return NfcCommandContinue;
     }
@@ -260,14 +267,14 @@ static NfcCommand ntag5_sensor_poller_callback(NfcGenericEvent event, void* cont
     // Tag gone or unusable: start over with an inventory next time
     instance->selected = false;
     if(result == Ntag5ResultNoAnswer) {
-        if(instance->last_status != Ntag5SensorStatusWaiting) {
-            ntag5_sensor_report_status(instance, Ntag5SensorStatusWaiting);
+        if(instance->last_status != TempSensorStatusWaiting) {
+            ntag5_sensor_report_status(instance, TempSensorStatusWaiting);
         }
     } else if(
-        instance->last_status != Ntag5SensorStatusNotSensor &&
-        instance->last_status != Ntag5SensorStatusNoPower) {
+        instance->last_status != TempSensorStatusNotSensor &&
+        instance->last_status != TempSensorStatusNoPower) {
         // Rejected command without a more specific report, e.g. no sensor on the I2C bus
-        ntag5_sensor_report_status(instance, Ntag5SensorStatusNotSensor);
+        ntag5_sensor_report_status(instance, TempSensorStatusNotSensor);
     }
     ntag5_sensor_sleep(instance, NTAG5_RETRY_INTERVAL_MS);
 
@@ -295,7 +302,7 @@ void ntag5_sensor_free(Ntag5Sensor* instance) {
     free(instance);
 }
 
-void ntag5_sensor_start(Ntag5Sensor* instance, Ntag5SensorCallback callback, void* context) {
+void ntag5_sensor_start(Ntag5Sensor* instance, TempSensorCallback callback, void* context) {
     furi_check(instance);
     furi_check(callback);
     furi_check(instance->poller == NULL);
@@ -304,9 +311,10 @@ void ntag5_sensor_start(Ntag5Sensor* instance, Ntag5SensorCallback callback, voi
     instance->context = context;
     instance->stopping = false;
     instance->selected = false;
-    instance->last_status = Ntag5SensorStatusWaiting;
+    instance->last_status = TempSensorStatusWaiting;
+    instance->id[0] = '\0';
 
-    ntag5_sensor_report_status(instance, Ntag5SensorStatusWaiting);
+    ntag5_sensor_report_status(instance, TempSensorStatusWaiting);
 
     instance->poller = nfc_poller_alloc(instance->nfc, NfcProtocolIso15693_3);
     nfc_poller_start(instance->poller, ntag5_sensor_poller_callback, instance);
