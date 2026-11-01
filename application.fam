@@ -7,6 +7,6 @@ App(
     stack_size=2 * 1024,
     fap_category="Tools",
     fap_icon="paw_10px.png",
-    fap_version="0.2",
+    fap_version="0.3",
     fap_description="Reads temperature patches (NTAG 5 link + TMP117) and FDX-B animal chips with temperature",
 )

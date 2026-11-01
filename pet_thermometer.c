@@ -9,6 +9,7 @@
 #include "body_temp_estimator.h"
 #include "fdxb_sensor.h"
 #include "ntag5_sensor.h"
+#include "pet_animation.h"
 
 #define SETTINGS_PATH    APP_DATA_PATH("settings")
 #define SETTINGS_MAGIC   (0x50)
@@ -19,6 +20,12 @@ typedef enum {
     ThermometerViewLocation,
     ThermometerViewReading,
 } ThermometerView;
+
+typedef enum {
+    ThermometerEventTagArrived, /**< A tag came into the field, its ID is in arrived_id */
+    ThermometerEventNextFrame,
+    ThermometerEventSkip,
+} ThermometerEvent;
 
 typedef enum {
     TagTypeNtag5, /**< NFC patch, NTAG 5 link with TMP117 */
@@ -39,6 +46,14 @@ typedef struct {
     bool has_value; /**< temperature and id hold the last good reading */
     float temperature; /**< Skin temperature */
     char id[TEMP_SENSOR_ID_SIZE];
+
+    char arrived_id[TEMP_SENSOR_ID_SIZE]; /**< Tag that just came into the field */
+
+    bool animation_active; /**< Draw the frame instead of the reading */
+    uint8_t animation_width;
+    uint8_t animation_height;
+    char animation_name[PET_ANIMATION_NAME_SIZE + 1];
+    uint8_t frame[PET_ANIMATION_FRAME_MAX];
 } ThermometerReadingModel;
 
 typedef struct {
@@ -51,6 +66,14 @@ typedef struct {
     Ntag5Sensor* ntag5;
     FdxbSensor* fdxb;
     ThermometerSettings settings;
+
+    PetAnimation* animation;
+    FuriTimer* animation_timer;
+    uint8_t frame[PET_ANIMATION_FRAME_MAX]; /**< Read buffer, outside the model lock */
+
+    /* Sensor worker thread state */
+    bool tag_present;
+    char present_id[TEMP_SENSOR_ID_SIZE];
 } ThermometerApp;
 
 typedef struct {
@@ -171,11 +194,37 @@ static void thermometer_draw_temperature(Canvas* canvas, const ThermometerReadin
     }
 }
 
+static void thermometer_draw_animation(Canvas* canvas, const ThermometerReadingModel* model) {
+    const uint8_t width = model->animation_width;
+    const uint8_t height = model->animation_height;
+
+    canvas_draw_xbm(canvas, (128 - width) / 2, (64 - height) / 2, width, height, model->frame);
+
+    if(model->animation_name[0] != '\0') {
+        canvas_set_font(canvas, FontPrimary);
+        const uint16_t text_width = canvas_string_width(canvas, model->animation_name);
+        const uint16_t box_width = text_width + 8;
+        const uint16_t box_x = (128 - box_width) / 2;
+
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_box(canvas, box_x, 50, box_width, 14);
+        canvas_set_color(canvas, ColorBlack);
+        canvas_draw_rframe(canvas, box_x, 50, box_width, 14, 3);
+        canvas_draw_str_aligned(canvas, 64, 61, AlignCenter, AlignBottom, model->animation_name);
+    }
+}
+
 static void thermometer_reading_draw_callback(Canvas* canvas, void* model_pointer) {
     const ThermometerReadingModel* model = model_pointer;
     const TagTypeInfo* info = &tag_types[model->tag_type];
 
     canvas_clear(canvas);
+
+    if(model->animation_active) {
+        thermometer_draw_animation(canvas, model);
+        return;
+    }
+
     thermometer_draw_title(canvas, model);
 
     if(model->has_value) {
@@ -204,6 +253,17 @@ static void thermometer_reading_draw_callback(Canvas* canvas, void* model_pointe
 static void thermometer_sensor_callback(const TempSensorReading* reading, void* context) {
     ThermometerApp* app = context;
 
+    // A tag counts as arrived when it answers after the field was empty, or when another
+    // tag answers. Chips without temperature have an ID too and are greeted as well.
+    bool arrived = false;
+    if(reading->status == TempSensorStatusWaiting) {
+        app->tag_present = false;
+    } else if(reading->id[0] != '\0') {
+        arrived = !app->tag_present || strcmp(app->present_id, reading->id) != 0;
+        app->tag_present = true;
+        strlcpy(app->present_id, reading->id, sizeof(app->present_id));
+    }
+
     with_view_model(
         app->reading_view,
         ThermometerReadingModel * model,
@@ -214,16 +274,140 @@ static void thermometer_sensor_callback(const TempSensorReading* reading, void* 
                 model->temperature = reading->temperature;
                 strlcpy(model->id, reading->id, sizeof(model->id));
             }
+            if(arrived) {
+                strlcpy(model->arrived_id, reading->id, sizeof(model->arrived_id));
+            }
         },
         true);
 
     if(reading->status == TempSensorStatusOk) {
         notification_message(app->notifications, &sequence_blink_green_10);
     }
+    if(arrived) {
+        view_dispatcher_send_custom_event(app->view_dispatcher, ThermometerEventTagArrived);
+    }
+}
+
+/* Timer thread */
+static void thermometer_animation_timer_callback(void* context) {
+    ThermometerApp* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, ThermometerEventNextFrame);
+}
+
+static void thermometer_animation_stop(ThermometerApp* app) {
+    furi_timer_stop(app->animation_timer);
+    pet_animation_close(app->animation);
+
+    with_view_model(
+        app->reading_view,
+        ThermometerReadingModel * model,
+        { model->animation_active = false; },
+        true);
+}
+
+static void thermometer_animation_start(ThermometerApp* app) {
+    char id[TEMP_SENSOR_ID_SIZE];
+
+    if(pet_animation_is_open(app->animation)) {
+        return;
+    }
+
+    with_view_model(
+        app->reading_view,
+        ThermometerReadingModel * model,
+        { strlcpy(id, model->arrived_id, sizeof(id)); },
+        false);
+
+    if(!pet_animation_open(app->animation, id)) {
+        return;
+    }
+    if(!pet_animation_next_frame(app->animation, app->frame)) {
+        pet_animation_close(app->animation);
+        return;
+    }
+
+    with_view_model(
+        app->reading_view,
+        ThermometerReadingModel * model,
+        {
+            model->animation_active = true;
+            model->animation_width = pet_animation_get_width(app->animation);
+            model->animation_height = pet_animation_get_height(app->animation);
+            strlcpy(
+                model->animation_name,
+                pet_animation_get_name(app->animation),
+                sizeof(model->animation_name));
+            memcpy(model->frame, app->frame, sizeof(model->frame));
+        },
+        true);
+
+    notification_message(app->notifications, &sequence_success);
+    furi_timer_start(
+        app->animation_timer, furi_ms_to_ticks(pet_animation_get_frame_ms(app->animation)));
+}
+
+static void thermometer_animation_next_frame(ThermometerApp* app) {
+    if(!pet_animation_is_open(app->animation)) {
+        return;
+    }
+
+    if(!pet_animation_next_frame(app->animation, app->frame)) {
+        thermometer_animation_stop(app);
+        return;
+    }
+
+    with_view_model(
+        app->reading_view,
+        ThermometerReadingModel * model,
+        { memcpy(model->frame, app->frame, sizeof(model->frame)); },
+        true);
+}
+
+static bool thermometer_custom_event_callback(void* context, uint32_t event) {
+    ThermometerApp* app = context;
+
+    switch(event) {
+    case ThermometerEventTagArrived:
+        thermometer_animation_start(app);
+        return true;
+    case ThermometerEventNextFrame:
+        thermometer_animation_next_frame(app);
+        return true;
+    case ThermometerEventSkip:
+        if(pet_animation_is_open(app->animation)) {
+            thermometer_animation_stop(app);
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* OK or Back skip a running animation */
+static bool thermometer_reading_input_callback(InputEvent* event, void* context) {
+    ThermometerApp* app = context;
+    bool active = false;
+
+    if(event->key != InputKeyOk && event->key != InputKeyBack) {
+        return false;
+    }
+
+    with_view_model(
+        app->reading_view,
+        ThermometerReadingModel * model,
+        { active = model->animation_active; },
+        false);
+
+    if(active && event->type == InputTypeShort) {
+        view_dispatcher_send_custom_event(app->view_dispatcher, ThermometerEventSkip);
+    }
+    return active;
 }
 
 static void thermometer_reading_enter_callback(void* context) {
     ThermometerApp* app = context;
+
+    app->tag_present = false;
 
     if(app->settings.tag_type == TagTypeFdxb) {
         fdxb_sensor_start(app->fdxb, thermometer_sensor_callback, app);
@@ -234,6 +418,8 @@ static void thermometer_reading_enter_callback(void* context) {
 
 static void thermometer_reading_exit_callback(void* context) {
     ThermometerApp* app = context;
+
+    thermometer_animation_stop(app);
 
     if(app->settings.tag_type == TagTypeFdxb) {
         fdxb_sensor_stop(app->fdxb);
@@ -296,6 +482,9 @@ static ThermometerApp* thermometer_app_alloc(void) {
     app->ntag5 = ntag5_sensor_alloc();
     app->fdxb = fdxb_sensor_alloc();
     thermometer_settings_load(&app->settings);
+    app->animation = pet_animation_alloc();
+    app->animation_timer =
+        furi_timer_alloc(thermometer_animation_timer_callback, FuriTimerTypePeriodic, app);
 
     app->tag_type_menu = submenu_alloc();
     submenu_set_header(app->tag_type_menu, "Which sensor?");
@@ -325,6 +514,7 @@ static ThermometerApp* thermometer_app_alloc(void) {
     view_allocate_model(app->reading_view, ViewModelTypeLocking, sizeof(ThermometerReadingModel));
     view_set_context(app->reading_view, app);
     view_set_draw_callback(app->reading_view, thermometer_reading_draw_callback);
+    view_set_input_callback(app->reading_view, thermometer_reading_input_callback);
     view_set_enter_callback(app->reading_view, thermometer_reading_enter_callback);
     view_set_exit_callback(app->reading_view, thermometer_reading_exit_callback);
     view_set_previous_callback(app->reading_view, thermometer_reading_previous_callback);
@@ -337,6 +527,8 @@ static ThermometerApp* thermometer_app_alloc(void) {
         app->view_dispatcher, ThermometerViewLocation, submenu_get_view(app->location_menu));
     view_dispatcher_add_view(app->view_dispatcher, ThermometerViewReading, app->reading_view);
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
+    view_dispatcher_set_custom_event_callback(
+        app->view_dispatcher, thermometer_custom_event_callback);
     view_dispatcher_set_navigation_event_callback(
         app->view_dispatcher, thermometer_navigation_callback);
 
@@ -352,6 +544,8 @@ static void thermometer_app_free(ThermometerApp* app) {
     view_free(app->reading_view);
     submenu_free(app->location_menu);
     submenu_free(app->tag_type_menu);
+    furi_timer_free(app->animation_timer);
+    pet_animation_free(app->animation);
     fdxb_sensor_free(app->fdxb);
     ntag5_sensor_free(app->ntag5);
 

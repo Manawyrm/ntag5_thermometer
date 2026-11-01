@@ -24,6 +24,31 @@ tag number (NFC: UID, FDX-B: country code and national number). The green LED bl
 every reading. When the sensor is removed, the last values stay on screen and the title line
 shows a note. The sensor type and location are remembered for the next start.
 
+## Celebration animations
+
+When a tag comes into the field and a file named after its ID exists, the app plays that
+animation, with the pet's name on top, before showing the temperature again. Measuring
+continues in the background, OK or Back skips the animation. It plays again after the tag
+was removed (the "removed" note shows) and put back.
+
+Files go to `/ext/apps_data/ntag5_thermometer/pets/<ID>.anim`, where `<ID>` is the tag number
+exactly as the app shows it, e.g. `276-098510868983.anim` for an FDX-B chip or
+`E0040150A1B2C3D4.anim` for an NFC patch. For a tag without an animation, the app logs the
+file name it looked for (`log` in the Flipper CLI: `No animation /data/pets/<ID>.anim`).
+
+`tools/make_anim.py` converts GIFs or single images (scaled to fit 128x64, black and white)
+and has a built-in demo, a hopping paw with hearts:
+
+```sh
+tools/make_anim.py cat.gif 276-098510868983.anim --name Sarah
+tools/make_anim.py --demo 276-098510868983.anim --name Sarah --preview preview.gif
+```
+
+Options: `--loops` (how often it plays, default 2), `--frame-ms`, `--invert` for dark
+backgrounds, `--dither` for photos, `--threshold`. The file format is documented in
+`pet_animation.h`. Copy the file with qFlipper or
+`python3 scripts/storage.py send <file> /ext/apps_data/ntag5_thermometer/pets/<file>`.
+
 ## NFC patches (NTAG 5 link)
 
 The command sequence is the one of the original app, sent as ISO 15693 custom commands
